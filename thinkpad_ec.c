@@ -45,7 +45,7 @@
 	#include <linux/semaphore.h>
 #endif
 
-#define TP_VERSION "0.41"
+#define TP_VERSION "0.50"
 
 MODULE_AUTHOR("Shem Multinymous");
 MODULE_DESCRIPTION("ThinkPad embedded controller hardware access");
@@ -74,6 +74,17 @@ MODULE_LICENSE("GPL");
 #define TPC_REQUEST_NDELAY    10
 #define TPC_PREFETCH_TIMEOUT   (HZ/10)  /* invalidate prefetch after 0.1sec */
 
+/* IO ports for the new (non H8S) controllers */
+/* It looks like we address values in the new controllers indirectly: put an address into 0x1610
+   and read or write a value from 0x1611 */
+#define NEW_ADDR_REG      0x1610
+#define NEW_VAL_REG       0x1611
+/* we read 32 register values */
+#define NEW_NR_REG        0x20
+
+#define NEW_TRIES_IDLE 2000
+#define NEW_WAIT_IDLE_UDELAY 10
+
 /* A few macros for printk()ing: */
 #define MSG_FMT(fmt, args...) \
   "thinkpad_ec: %s: " fmt "\n", __func__, ## args
@@ -84,6 +95,8 @@ MODULE_LICENSE("GPL");
 /* State of request prefetching: */
 static u8 prefetch_arg0, prefetch_argF;           /* Args of last prefetch */
 static u64 prefetch_jiffies;                      /* time of prefetch, or: */
+static int h8s_present;                           /* != 0 if we detected an old EC (aka an H8S) during init */
+ 
 #define TPC_PREFETCH_NONE   INITIAL_JIFFIES       /*   No prefetch */
 #define TPC_PREFETCH_JUNK   (INITIAL_JIFFIES+1)   /*   Ignore prefetch */
 
@@ -96,9 +109,22 @@ static DEFINE_SEMAPHORE(thinkpad_ec_mutex);
 
 /* Kludge in case the ACPI DSDT reserves the ports we need. */
 static bool force_io;    /* Willing to do IO to ports we couldn't reserve? */
+
+/* TODO: remove initialisation with 1 */
+static bool new_ec=1;  /* Try to talk to new EC (non-H8S) */
+
+/* H8S requests are translated for the new EC. This option forces
+   all unknown requests to be passed 1:1 to the new EC. */
+static bool new_ec_unknown_req;
 static int reserved_io; /* Successfully reserved the ports? */
 module_param_named(force_io, force_io, bool, 0600);
 MODULE_PARM_DESC(force_io, "Force IO even if region already reserved (0=off, 1=on)");
+module_param_named(new_ec, new_ec, bool, 0600);
+MODULE_PARM_DESC(new_ec, "Enable code to talk to newer EC (> T420). "
+		 "This is highly experimental and may brick your notebook!!!");
+module_param_named(new_ec_unknown_req, new_ec_unknown_req, bool, 0600);
+MODULE_PARM_DESC(new_ec_unknown_req, "Pass unknown requests untranslated to a new EC. "
+		 "This is highly experimental and may brick your notebook!!!");
 
 /**
  * thinkpad_ec_lock - get lock on the ThinkPad EC
@@ -139,15 +165,76 @@ void thinkpad_ec_unlock(void)
 }
 EXPORT_SYMBOL_GPL(thinkpad_ec_unlock);
 
+
 /**
- * thinkpad_ec_request_row - tell embedded controller to prepare a row
+ *  write 0 to port 1610h and wait until we read 0 from 1611h - I guess this waits for idle
+ */
+
+static int thinkpad_new_wait_idle(void)
+{
+	int i;
+	i=0;
+	while (i++ < NEW_TRIES_IDLE) {
+		outb(0, NEW_ADDR_REG);
+		if (!inb(NEW_VAL_REG))
+			return 0;
+		udelay(NEW_WAIT_IDLE_UDELAY);
+	}
+	return -EBUSY;
+}
+
+/**
+ * thinkpad_new_request_row - tell embedded controller to prepare a row
+ * @args Input register arguments
+ */
+static int thinkpad_new_request_row(const struct thinkpad_ec_row *args)
+{
+	int rc;
+	/* translate H8S requests (function codes?) into new EC ones. Currently we only know
+	   0 -> 1, 1 -> 2, 2 -> 3, 6 -> 6 */
+	static const s8 tr[] = {1,2,3,-1,-1,-1,6};
+	int tr_req;
+
+	if (args->mask != ((1<<15)|(1<<0))) {
+		/* we can only translate requests with TWR0/TWR15 set */
+		printk(KERN_ERR MSG_FMT("unsupported mask %x", args->mask));
+		return -EINVAL;
+	}
+
+	if (args->val[0] >= ARRAY_SIZE(tr) || (!new_ec_unknown_req && tr[args->val[0]] == -1)) {
+		printk(KERN_ERR MSG_FMT("unsupported request 0x%x", args->val[0]));
+		return -EINVAL;
+	}
+	tr_req = tr[args->val[0]];
+	if (tr_req == -1)
+		tr_req = args->val[0];
+
+	if ((rc=thinkpad_new_wait_idle())) {
+		printk(KERN_ERR MSG_FMT("EC doesn't get idle"));
+		return rc;
+	}
+
+	outb(1, NEW_ADDR_REG);
+	outb(0xff, NEW_VAL_REG);
+	
+	outb(0x10, NEW_ADDR_REG);
+	outb(args->val[0xf], NEW_VAL_REG); /* battery number (0,1) */
+
+	outb(0, NEW_ADDR_REG);
+	outb(tr_req, NEW_VAL_REG); /* we must send the translated request */
+
+	return 0;
+}
+
+/**
+ * thinkpad_h8s_request_row - tell embedded controller to prepare a row
  * @args Input register arguments
  *
  * Requests a data row by writing to H8S LPC registers TRW0 through TWR15 (or
  * a subset thereof) following the protocol prescribed by the "H8S/2104B Group
  * Hardware Manual". Does sanity checks via status register STR3.
  */
-static int thinkpad_ec_request_row(const struct thinkpad_ec_row *args)
+static int thinkpad_h8s_request_row(const struct thinkpad_ec_row *args)
 {
 	u8 str3;
 	int i;
@@ -216,15 +303,21 @@ static int thinkpad_ec_request_row(const struct thinkpad_ec_row *args)
 	return -EIO;
 }
 
+static int thinkpad_ec_request_row(const struct thinkpad_ec_row *args)
+{
+	return (h8s_present) ? thinkpad_h8s_request_row(args) :
+		thinkpad_new_request_row(args);
+}
+
 /**
- * thinkpad_ec_read_data - read pre-requested row-data from EC
+ * thinkpad_h8s_read_data - read pre-requested row-data from EC
  * @args Input register arguments of pre-requested rows
  * @data Output register values
  *
  * Reads current row data from the controller, assuming it's already
  * requested. Follows the H8S spec for register access and status checks.
  */
-static int thinkpad_ec_read_data(const struct thinkpad_ec_row *args,
+static int thinkpad_h8s_read_data(const struct thinkpad_ec_row *args,
 				 struct thinkpad_ec_row *data)
 {
 	int i;
@@ -263,6 +356,53 @@ static int thinkpad_ec_read_data(const struct thinkpad_ec_row *args,
 		printk(KERN_WARNING
 		       REQ_FMT("0x161F reports error", data->val[0xF]));
 	return 0;
+}
+
+/**
+ * thinkpad_new_read_data - read pre-requested row-data from non-H8S EC
+ * @args Input register arguments of pre-requested rows
+ * @data Output register values
+ *@extra_data output register values (10h,11h,...,1fh) - if non-NULL (for debugging)
+ *
+ * Reads current row data from the controller, assuming it's already
+ * requested.
+ */
+static int thinkpad_new_read_data(const struct thinkpad_ec_row *args,
+				  struct thinkpad_ec_row *data, u8 *extra_data)
+{
+	int rc,i;
+	
+	if ((rc=thinkpad_new_wait_idle())) {
+		printk(KERN_ERR MSG_FMT("EC doesn't get idle"));
+		goto finish;
+	}
+
+	for(i=0; i < NEW_NR_REG; i++) {
+		u8 val;
+		outb(i+0x10, NEW_ADDR_REG);
+		val = inb(NEW_VAL_REG);
+		if (i < TP_CONTROLLER_ROW_LEN) {
+			if (data->mask & (1<<i))
+				data->val[i] = val;
+		} else {
+			if (extra_data)
+				extra_data[i-TP_CONTROLLER_ROW_LEN] = val;
+		}
+	}
+
+finish:
+	/* we have to execute this even if thinkpad_new_wait_idle returned non-zero */
+	outb(1, NEW_ADDR_REG);
+	outb(0, NEW_VAL_REG);
+
+	return rc;
+}
+
+static int thinkpad_ec_read_data(const struct thinkpad_ec_row *args,
+				 struct thinkpad_ec_row *data)
+{
+	return h8s_present ? thinkpad_h8s_read_data(args, data) :
+		thinkpad_new_read_data(args, data, NULL);
 }
 
 /**
@@ -409,6 +549,47 @@ EXPORT_SYMBOL_GPL(thinkpad_ec_invalidate);
 
 
 /*** Checking for EC hardware ***/
+static int __init thinkpad_new_dump(void)
+{
+	int ret;
+	struct thinkpad_ec_row args;
+	struct thinkpad_ec_row data = { .mask = 0xffff };
+
+	/* list of requests - extend this if you dare */
+	const u8 req[] = {0,1,2,6};
+	int i;
+	u8 extra[NEW_NR_REG-TP_CONTROLLER_ROW_LEN];
+	for(i=0; i < ARRAY_SIZE(req); i++) {
+		args.val[0] = req[i];
+
+		ret = thinkpad_ec_lock();
+
+		if (ret)
+			return ret;
+		ret = thinkpad_new_request_row(&args);
+		if (ret) {
+			printk(KERN_ERR MSG_FMT("req 0x%x: thinkpad_new_request_row failed with %d",
+						args.val[0], ret));
+			goto unlock;
+		}
+
+		ret = thinkpad_new_read_data(&args, &data, extra);
+		if (!ret) {
+			printk(KERN_INFO MSG_FMT("req 0x%x %*ph  %*ph", args.val[0],
+						 (int)ARRAY_SIZE(data.val), data.val,
+						 (int)ARRAY_SIZE(extra), extra));
+		} else {
+			printk(KERN_ERR MSG_FMT("req 0x%x: thinkpad_new_read_data failed with %d",
+						args.val[0], ret));
+			goto unlock;
+		}
+
+	unlock:	
+		thinkpad_ec_unlock();
+	} /* for(i=0;...) */
+
+	return ret;
+}
 
 /**
  * thinkpad_ec_test - verify the EC is present and follows protocol
@@ -425,11 +606,21 @@ static int __init thinkpad_ec_test(void)
 	const struct thinkpad_ec_row args = /* battery 0 basic status */
 	  { .mask = 0x8001, .val = {0x01,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0x00} };
 	struct thinkpad_ec_row data = { .mask = 0x0000 };
+
+	h8s_present = 1;
+
 	ret = thinkpad_ec_lock();
+
 	if (ret)
 		return ret;
 	ret = thinkpad_ec_read_row(&args, &data);
+	if (ret == -EIO) {
+		h8s_present = 0;
+		ret = thinkpad_ec_read_row(&args, &data);
+	}
+
 	thinkpad_ec_unlock();
+
 	return ret;
 }
 
@@ -498,7 +689,14 @@ static int __init thinkpad_ec_init(void)
 			release_region(TPC_BASE_PORT, TPC_NUM_PORTS);
 		return -ENXIO;
 	}
-	printk(KERN_INFO "thinkpad_ec: thinkpad_ec " TP_VERSION " loaded.\n");
+
+	/* for initial debugging: dump the new EC registers */
+	if (!h8s_present) {
+		thinkpad_new_dump();
+	}
+
+	printk(KERN_INFO "thinkpad_ec: thinkpad_ec " TP_VERSION " loaded. %s EC detected\n",
+	       h8s_present ? "H8S" : "New");
 	return 0;
 }
 

@@ -29,6 +29,8 @@
  *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#define DEBUG
+
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/dmi.h>
@@ -173,13 +175,18 @@ EXPORT_SYMBOL_GPL(thinkpad_ec_unlock);
 static int thinkpad_new_wait_idle(void)
 {
 	int i;
+	u8 v;
+
 	i=0;
 	while (i++ < NEW_TRIES_IDLE) {
 		outb(0, NEW_ADDR_REG);
-		if (!inb(NEW_VAL_REG))
+		if (!(v=inb(NEW_VAL_REG)))
 			return 0;
 		udelay(NEW_WAIT_IDLE_UDELAY);
 	}
+
+	pr_err("%s NEW_VAL_REG is stuck with %02x\n", __FUNCTION__, v);
+ 
 	return -EBUSY;
 }
 
@@ -200,6 +207,8 @@ static int thinkpad_new_request_row(const struct thinkpad_ec_row *args)
 		printk(KERN_ERR MSG_FMT("unsupported mask %x", args->mask));
 		return -EINVAL;
 	}
+
+	pr_err("%s args: mask %x val: %*ph\n", __FUNCTION__, args->mask, sizeof(args->val), args->val);
 
 	if (args->val[0] >= ARRAY_SIZE(tr) || (!new_ec_unknown_req && tr[args->val[0]] == -1)) {
 		printk(KERN_ERR MSG_FMT("unsupported request 0x%x", args->val[0]));
@@ -371,7 +380,8 @@ static int thinkpad_new_read_data(const struct thinkpad_ec_row *args,
 				  struct thinkpad_ec_row *data, u8 *extra_data)
 {
 	int rc,i;
-	
+	u8 extra[NEW_NR_REG - TP_CONTROLLER_ROW_LEN];
+
 	if ((rc=thinkpad_new_wait_idle())) {
 		printk(KERN_ERR MSG_FMT("EC doesn't get idle"));
 		goto finish;
@@ -385,10 +395,15 @@ static int thinkpad_new_read_data(const struct thinkpad_ec_row *args,
 			if (data->mask & (1<<i))
 				data->val[i] = val;
 		} else {
-			if (extra_data)
-				extra_data[i-TP_CONTROLLER_ROW_LEN] = val;
+		  extra[i - TP_CONTROLLER_ROW_LEN] = val;
 		}
 	}
+
+	pr_err("%s data: mask %x val %*ph extra %*ph\n", __FUNCTION__, data->mask,
+		 sizeof(data->val), data->val, sizeof(extra), extra);
+
+	if (extra_data)
+	  memcpy(extra_data, extra, sizeof(extra));
 
 finish:
 	/* we have to execute this even if thinkpad_new_wait_idle returned non-zero */
@@ -614,9 +629,12 @@ static int __init thinkpad_ec_test(void)
 	if (ret)
 		return ret;
 	ret = thinkpad_ec_read_row(&args, &data);
-	if (ret == -EIO) {
+	pr_err("%s: first read_row failed with %d\n", __FUNCTION__, ret);
+
+	if (ret) {
 		h8s_present = 0;
-		ret = thinkpad_ec_read_row(&args, &data);
+		ret = thinkpad_ec_read_row(&args, &data);	
+		pr_err("%s: second read_row failed with %d\n", __FUNCTION__, ret);
 	}
 
 	thinkpad_ec_unlock();
@@ -663,6 +681,9 @@ static int __init check_dmi_for_ec(void)
 
 static int __init thinkpad_ec_init(void)
 {
+  printk(KERN_INFO "thinkpad_ec version " TP_VERSION " new_ec %i new_ec_unknown_req %i\n",
+	 new_ec, new_ec_unknown_req);
+
 	if (!check_dmi_for_ec()) {
 		printk(KERN_WARNING
 		       "thinkpad_ec: no ThinkPad embedded controller!\n");
